@@ -1,0 +1,47 @@
+# Node.js
+node_modules/
+
+# Truffle build artifacts
+build/
+
+# Truffle migrations artifacts
+migrations/*.log
+
+# Flattened contracts
+flattened/
+
+# Logs
+*.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Environment files
+.env
+
+# Coverage reports
+coverage/
+
+# IDE files
+.vscode/
+.idea/
+
+# Test output
+*.out
+
+# npm debug files
+npm-debug.log*
+
+# Windows
+*.exe
+*.dll
+*.bat
+
+# Mac
+*.dmg
+
+# Misc
+*.swp
+*.swo
+

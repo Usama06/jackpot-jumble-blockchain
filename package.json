@@ -1,0 +1,19 @@
+{
+  "dependencies": {
+    "@openzeppelin/contracts": "^4.9.6",
+    "@openzeppelin/test-helpers": "^0.5.16",
+    "@truffle/hdwallet-provider": "^2.1.15",
+    "chai": "^4.3.7",
+    "dotenv": "^16.5.0"
+  },
+  "scripts": {
+    "compile": "truffle compile",
+    "deploy local": "truffle migrate",
+    "test": "truffle test"
+  },
+  "author": "Usama",
+  "devDependencies": {
+    "truffle": "^5.11.5",
+    "truffle-plugin-verify": "^0.6.7"
+  }
+}
