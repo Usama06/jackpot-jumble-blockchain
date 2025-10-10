@@ -4,20 +4,20 @@ const HDWalletProvider = require('@truffle/hdwallet-provider');
 
 module.exports = {
     networks: {
-        amoy: {
-            provider: () =>
-                new HDWalletProvider(
-                    process.env.PRIVATE_KEY,
-                    'https://polygon-amoy.g.alchemy.com/v2/vLdSAoe5PvbxBDWSLAk2_BGriSoyf36B'
-                ),
-            network_id: 80002,
-            confirmations: 2,
-            timeoutBlocks: 200,
-            networkCheckTimeout: 500000,
-            skipDryRun: true,
-            maxFeePerGas: 100_000_000_000,          // 100 Gwei
-            maxPriorityFeePerGas: 30_000_000_000    // 30 Gwei
-        },
+        // amoy: {
+        //     provider: () =>
+        //         new HDWalletProvider(
+        //             process.env.PRIVATE_KEY,
+        //             'https://polygon-amoy.g.alchemy.com/v2/vLdSAoe5PvbxBDWSLAk2_BGriSoyf36B'
+        //         ),
+        //     network_id: 80002,
+        //     confirmations: 2,
+        //     timeoutBlocks: 200,
+        //     networkCheckTimeout: 500000,
+        //     skipDryRun: true,
+        //     maxFeePerGas: 100_000_000_000,          // 100 Gwei
+        //     maxPriorityFeePerGas: 30_000_000_000    // 30 Gwei
+        // },
         development: {
             host: "127.0.0.1",     // Localhost (default: none)
             port: 7545,            // Standard Ethereum port (default: none)

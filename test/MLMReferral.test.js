@@ -1,271 +1,484 @@
-const {expectRevert} = require('@openzeppelin/test-helpers');
-const {assert} = require('chai');
+/* eslint-disable no-undef */
+const {expectRevert, time} = require("@openzeppelin/test-helpers");
+const {assert, expect} = require("chai");
 
 const MLMReferral = artifacts.require("MLMReferral");
 const MockUSDT = artifacts.require("MockUSDT");
 
-const JOIN_AMOUNT = web3.utils.toWei("10", "ether");
+// --- helpers -------------------------------------------------
 
-contract("MLMReferral", (accounts) => {
+/** Convert 6-char ASCII (A-Z,0-9) to bytes6 hex ("ABC123" -> "0x414243313233") */
+function bytes6FromAscii(str) {
+    if (str.length !== 6) throw new Error("needs 6 chars");
+    return "0x" + Buffer.from(str, "ascii").toString("hex");
+}
+
+/** Return SCALE = 10 ** decimals (BN) */
+async function scaleOf(token) {
+    const dec = await token.decimals();
+    return web3.utils.toBN("10").pow(web3.utils.toBN(dec));
+}
+
+/** Return amount in token units: n * SCALE */
+async function units(token, nString) {
+    const scl = await scaleOf(token);
+    return scl.mul(web3.utils.toBN(nString));
+}
+
+contract("MLMReferral (prod, bytes6 codes)", (accounts) => {
+    const [admin, u1, u2, u3, u4, u5, ...rest] = accounts;
+
     let usdt, mlm;
-
-    const admin = accounts[0];
-    const user1 = accounts[1];
-    const user2 = accounts[2];
-    const user3 = accounts[3];
-    const user4 = accounts[4];
-    const user5 = accounts[5];
-
-    const JOIN_AMOUNT = web3.utils.toWei("10", "ether");
+    let SCALE, JOIN_AMOUNT, DIRECT_REWARD, INDIRECT_TOTAL, ADMIN_REWARD;
 
     beforeEach(async () => {
-        usdt = await MockUSDT.new();
-        mlm = await MLMReferral.new(usdt.address);
+        usdt = await MockUSDT.new({from: admin}); // must implement decimals()
+        mlm = await MLMReferral.new(usdt.address, {from: admin});
 
-        const users = [user1, user2, user3, user4, user5];
-        for (let user of users) {
-            await usdt.transfer(user, JOIN_AMOUNT, {from: admin});
-            await usdt.approve(mlm.address, JOIN_AMOUNT, {from: user});
+        SCALE = await scaleOf(usdt);
+        JOIN_AMOUNT = SCALE.muln(10);
+        DIRECT_REWARD = SCALE.muln(2);
+        INDIRECT_TOTAL = SCALE.muln(1);
+        ADMIN_REWARD = SCALE.muln(7);
+
+        // Give everyone plenty of tokens and approve the contract
+        const all = accounts.slice(0, 20);
+        for (const a of all) {
+            // If your MockUSDT doesn't mint to admin by default, mint or seed first.
+            // Here we transfer from admin assuming initial supply at admin.
+            await usdt.transfer(a, JOIN_AMOUNT.muln(100), {from: admin});
+            await usdt.approve(mlm.address, JOIN_AMOUNT.muln(100), {from: a});
         }
-
-        await usdt.approve(mlm.address, JOIN_AMOUNT, {from: admin});
     });
 
-    it("should deploy correctly and mark admin as joined", async () => {
+    // --------------------------------------------------------------------------
+    // Deployment & admin bootstrap
+    // --------------------------------------------------------------------------
+
+    it("deploys, admin is joined, has 6-char code", async () => {
         const isAdminJoined = await mlm.hasJoined(admin);
-        expect(isAdminJoined).to.be.true;
+        assert.isTrue(isAdminJoined, "admin should be marked joined");
 
+        const adminCodeRaw = await mlm.referralCodes(admin);
+        // bytes6 hex length = 2 + 12 = 14
+        assert.equal(adminCodeRaw.length, 14, "raw bytes6 hex should be 14 chars");
+
+        const adminCodeStr = await mlm.referralCodeStringOf(admin);
+        assert.equal(adminCodeStr.length, 6, "string code should be 6 chars");
+    });
+
+    // --------------------------------------------------------------------------
+    // Join (no code) -> parent = admin
+    // --------------------------------------------------------------------------
+
+    it("user can join without referral code (defaults to admin)", async () => {
+        await mlm.joinProgram("0x000000000000", {from: u1});
+
+        assert.isTrue(await mlm.hasJoined(u1), "u1 joined");
+        assert.equal(await mlm.parentOf(u1), admin, "parent is admin");
+
+        // Parent direct earnings +2
+        const direct = await mlm.directEarnings(admin);
+        assert.equal(direct.toString(), DIRECT_REWARD.toString(), "admin direct +2");
+
+        // No ancestors => adminCommission gets +7 (admin) +1 (indirect) = +8
+        const commission = await mlm.adminCommission();
+        assert.equal(
+            commission.toString(),
+            ADMIN_REWARD.add(INDIRECT_TOTAL).toString(),
+            "adminCommission +8"
+        );
+    });
+
+    // --------------------------------------------------------------------------
+    // Join with valid code (multi-level) & earnings distribution
+    // --------------------------------------------------------------------------
+
+    it("multi-level joins distribute direct/indirect correctly (dust -> parent, no-ancestor -> adminCommission)", async () => {
+        // A joins using admin's code (parent=admin, no ancestors)
         const adminCode = await mlm.referralCodes(admin);
-        expect(adminCode.length).to.equal(6);
-    });
+        await mlm.joinProgram(adminCode, {from: u1});
 
-    it("should allow user to join without referral code (defaults to admin)", async () => {
-        await mlm.joinProgram("", {from: user1});
+        // B joins using A's code (parent=A, ancestors=[admin])
+        const codeA = await mlm.referralCodes(u1);
+        await mlm.joinProgram(codeA, {from: u2});
 
-        const isJoined = await mlm.hasJoined(user1);
-        expect(isJoined).to.be.true;
+        // C joins using B's code (parent=B, ancestors=[A, admin])
+        const codeB = await mlm.referralCodes(u2);
+        await mlm.joinProgram(codeB, {from: u3});
 
-        const parent = await mlm.parentOf(user1);
-        expect(parent).to.equal(admin);
-    });
+        // D joins using C's code (parent=C, ancestors=[B, A, admin])
+        const codeC = await mlm.referralCodes(u3);
+        await mlm.joinProgram(codeC, {from: u4});
 
-    it("should allow user to join with valid referral code", async () => {
-        await mlm.joinProgram("", {from: user1});
-        const code = await mlm.referralCodes(user1);
+        // After these joins, inspect:
+        // Direct:
+        // - On B join: A +2
+        // - On C join: B +2
+        // - On D join: C +2    (+ dust remainder from D's indirect split)
+        //
+        // Indirect splits:
+        // - B's join: ancestors=[admin] -> admin +1
+        // - C's join: ancestors=[A, admin] -> each gets floor(1/2) = 0.5 * SCALE
+        // - D's join: ancestors=[B, A, admin] -> each gets floor(1/3) * SCALE; remainder = 1 - 3*floor(1/3)
+        //   remainder goes to parent (C)
 
-        await mlm.joinProgram(code, {from: user2});
+        // Direct earnings
+        const directA = await mlm.directEarnings(u1);
+        const directB = await mlm.directEarnings(u2);
+        const directC = await mlm.directEarnings(u3);
+        // Indirect earnings
+        const indA = await mlm.indirectEarnings(u1);
+        const indAdmin = await mlm.indirectEarnings(admin);
 
-        const parent = await mlm.parentOf(user2);
-        expect(parent).to.equal(user1);
-    });
+        // Check direct for B and C: exactly +2 each
+        assert.equal(directB.toString(), DIRECT_REWARD.toString(), "B direct +2");
+        assert.equal(directC.gte(DIRECT_REWARD), true, "C direct >= +2 (may include dust)");
 
-    it("should assign a unique referral code to each user", async () => {
-        await mlm.joinProgram("", {from: user1});
-        await mlm.joinProgram("", {from: user2});
+        // A should have received indirect: 0.5 (from C) + floor(1/3) (from D)
+        const half = SCALE.divn(2);
+        const third = SCALE.divn(3);
+        const expectedAIndirect = half.add(third);
+        assert.equal(indA.toString(), expectedAIndirect.toString(), "A indirect 0.5 + 1/3");
 
-        const code1 = await mlm.referralCodes(user1);
-        const code2 = await mlm.referralCodes(user2);
-
-        expect(code1).to.not.equal(code2);
-    });
-
-    it("should distribute earnings correctly through levels", async () => {
-        const [admin, userA, userB, userC, userD] = accounts;
-
-        const adminReferralCode = await mlm.referralCodes(admin);
-
-        // A joins with admin's code
-        await usdt.transfer(userA, JOIN_AMOUNT, {from: admin});
-        await usdt.approve(mlm.address, JOIN_AMOUNT, {from: userA});
-        await mlm.joinProgram(adminReferralCode, {from: userA});
-
-        const referralCodeA = await mlm.referralCodes(userA);
-
-        // B joins with A's code
-        await usdt.transfer(userB, JOIN_AMOUNT, {from: admin});
-        await usdt.approve(mlm.address, JOIN_AMOUNT, {from: userB});
-        await mlm.joinProgram(referralCodeA, {from: userB});
-
-        const referralCodeB = await mlm.referralCodes(userB);
-
-        // C joins with B's code
-        await usdt.transfer(userC, JOIN_AMOUNT, {from: admin});
-        await usdt.approve(mlm.address, JOIN_AMOUNT, {from: userC});
-        await mlm.joinProgram(referralCodeB, {from: userC});
-
-        const referralCodeC = await mlm.referralCodes(userC);
-
-        // D joins with C's code
-        await usdt.transfer(userD, JOIN_AMOUNT, {from: admin});
-        await usdt.approve(mlm.address, JOIN_AMOUNT, {from: userD});
-        await mlm.joinProgram(referralCodeC, {from: userD});
-
-        // Verify earnings
-        const earningsC = await mlm.getDirectEarnings(userC);
-        const earningsA = await mlm.getIndirectEarnings(userA);
-        const earningsAdmin = await mlm.getIndirectEarnings(admin);
-
-        assert.equal(earningsC.toString(), web3.utils.toWei("2", "ether"), "C should get 2 USDT");
-        // 0.5 from C's join + 0.333... from D's join
+        // Admin indirect: +1 (from B) + 0.5 (from C) + 1/3 (from D)
+        const expectedAdminIndirect = SCALE.add(half).add(third);
         assert.equal(
-            earningsA.toString(),
-            "833333333333333333",
-            "A should get approx 0.833... USDT"
+            indAdmin.toString(),
+            expectedAdminIndirect.toString(),
+            "admin indirect 1 + 0.5 + 1/3"
         );
 
-// 1 from B's join + 0.5 from C + 0.333... from D
-        assert.equal(
-            earningsAdmin.toString(),
-            "1833333333333333333",
-            "Admin should get approx 1.833... USDT"
+        // C's direct should be +2 plus any remainder dust from D's split (SCALE % 3)
+        const remainder = SCALE.sub(third.muln(3)); // SCALE - 3*floor(SCALE/3)
+        const expectedCMin = DIRECT_REWARD.add(remainder);
+        assert.equal(directC.toString(), expectedCMin.toString(), "C direct +2 + dust remainder");
+
+        // adminCommission should be:
+        // A join: 7 + 1 (no ancestor) = +8
+        // B join: +7 (has ancestors) = +7
+        // C join: +7 (has ancestors) = +7
+        // D join: +7 (has ancestors) = +7
+        const expectedCommission = ADMIN_REWARD
+            .add(INDIRECT_TOTAL) // +8 from A
+            .add(ADMIN_REWARD)   // +7 from B
+            .add(ADMIN_REWARD)   // +7 from C
+            .add(ADMIN_REWARD);  // +7 from D
+        const commission = await mlm.adminCommission();
+        assert.equal(commission.toString(), expectedCommission.toString(), "adminCommission matches");
+    });
+
+    // --------------------------------------------------------------------------
+    // Invalid referral code (bytes6 not mapped)
+    // --------------------------------------------------------------------------
+
+    it("reverts on invalid referral code", async () => {
+        // random non-existent bytes6 like "ABC123"
+        const invalid = bytes6FromAscii("ABC123");
+        await expectRevert.unspecified(mlm.joinProgram(invalid, {from: u1}));
+    });
+
+    // --------------------------------------------------------------------------
+    // Already joined
+    // --------------------------------------------------------------------------
+
+    it("reverts if user tries to join twice", async () => {
+        await mlm.joinProgram("0x000000000000", {from: u1});
+        await expectRevert.unspecified(mlm.joinProgram("0x000000000000", {from: u1}));
+    });
+
+    // --------------------------------------------------------------------------
+    // Children getters
+    // --------------------------------------------------------------------------
+
+    it("returns children correctly & directChildrenCount()", async () => {
+        await mlm.joinProgram("0x000000000000", {from: u1}); // parent admin
+        const codeU1 = await mlm.referralCodes(u1);
+
+        await mlm.joinProgram(codeU1, {from: u2});
+        await mlm.joinProgram(codeU1, {from: u3});
+        await mlm.joinProgram(codeU1, {from: u4});
+
+        const kids = await mlm.getChildren(u1);
+        expect(kids).to.have.members([u2, u3, u4]);
+
+        const cnt = await mlm.directChildrenCount(u1);
+        assert.equal(cnt.toString(), "3", "u1 has 3 directs");
+    });
+
+    // --------------------------------------------------------------------------
+    // Admin withdraw limited by adminCommission
+    // --------------------------------------------------------------------------
+
+    it("admin can withdraw up to adminCommission (not full contract balance necessarily)", async () => {
+        // One join under admin: commission should be +8 * SCALE
+        const adminCode = await mlm.referralCodes(admin);
+        await mlm.joinProgram(adminCode, {from: u1});
+
+        const commission = await mlm.adminCommission();
+        const before = await usdt.balanceOf(admin);
+
+        await mlm.withdrawAdminFunds(admin, commission, {from: admin});
+
+        const after = await usdt.balanceOf(admin);
+        assert.equal(after.sub(before).toString(), commission.toString(), "admin got commission");
+
+        // Withdrawing more should revert
+        await expectRevert.unspecified(
+            mlm.withdrawAdminFunds(admin, SCALE, {from: admin}) // any positive amount now > commission
         );
     });
 
+    // --------------------------------------------------------------------------
+    // User withdraw eligibility: >= 10 directs required
+    // --------------------------------------------------------------------------
 
-    it("should fail with invalid referral code", async () => {
-        try {
-            await mlm.joinProgram("INVALID", {from: user1});
-            expect.fail("Expected error not thrown");
-        } catch (err) {
-            expect(err.reason).to.equal("Invalid referral code");
-        }
-    });
+    it("user can withdraw with exactly 10 direct referrals (>= 10 rule)", async () => {
+        await mlm.joinProgram("0x000000000000", {from: u1});
+        const codeU1 = await mlm.referralCodes(u1);
 
-    it("should not allow joining twice", async () => {
-        await mlm.joinProgram("", {from: user1});
-
-        try {
-            await mlm.joinProgram("", {from: user1});
-            expect.fail("Expected error not thrown");
-        } catch (err) {
-            expect(err.reason).to.equal("Already joined");
-        }
-    });
-
-    it("should return children correctly", async () => {
-        await mlm.joinProgram("", {from: user1});
-        const code = await mlm.referralCodes(user1);
-        await mlm.joinProgram(code, {from: user2});
-        await mlm.joinProgram(code, {from: user3});
-
-        const children = await mlm.getChildren(user1);
-        expect(children.length).to.equal(2);
-        expect(children).to.include.members([user2, user3]);
-    });
-
-    it("should allow admin to withdraw", async () => {
-        const [admin, userA] = accounts;
-
-        const adminReferralCode = await mlm.referralCodes(admin);
-
-        await usdt.transfer(userA, JOIN_AMOUNT, {from: admin});
-        await usdt.approve(mlm.address, JOIN_AMOUNT, {from: userA});
-        await mlm.joinProgram(adminReferralCode, {from: userA});
-
-        const contractBalance = await usdt.balanceOf(mlm.address);
-        const adminBalanceBefore = await usdt.balanceOf(admin);
-
-        await mlm.withdrawAdminFunds(admin, contractBalance, {from: admin});
-
-        const adminBalanceAfter = await usdt.balanceOf(admin);
-
-        assert.isTrue(
-            adminBalanceAfter.gt(adminBalanceBefore),
-            "Admin balance should increase after withdrawal"
-        );
-    });
-
-    it("should allow eligible user to withdraw earnings when direct referrals are greater than 10", async () => {
-        const eligibleUser = user1;
-
-        await mlm.joinProgram("", {from: eligibleUser});
-
-        // Generate referral code for eligibleUser
-        const userCode = await mlm.referralCodes(eligibleUser);
-
-        // Create 11 direct children (greater than 10)
-        for (let i = 0; i < 11; i++) {
-            const newUser = accounts[6 + i];
-            await usdt.transfer(newUser, JOIN_AMOUNT, {from: admin});
-            await usdt.approve(mlm.address, JOIN_AMOUNT, {from: newUser});
-            await mlm.joinProgram(userCode, {from: newUser});
-        }
-
-        // Verify direct children count
-        const children = await mlm.getChildren(eligibleUser);
-        assert.equal(children.length, 11, "User should have 11 direct children");
-
-        // Record earnings
-        const directEarnings = await mlm.getDirectEarnings(eligibleUser);
-        const indirectEarnings = await mlm.getIndirectEarnings(eligibleUser);
-        const totalEarnings = directEarnings.add(indirectEarnings);
-
-        // Record balance before withdrawal
-        const balanceBefore = await usdt.balanceOf(eligibleUser);
-
-        // Withdraw earnings
-        await mlm.withdrawEarnings({from: eligibleUser});
-
-        // Verify user balance increased
-        const balanceAfter = await usdt.balanceOf(eligibleUser);
-        assert.equal(
-            balanceAfter.sub(balanceBefore).toString(),
-            totalEarnings.toString(),
-            "User balance should increase by total earnings"
-        );
-
-        // Verify earnings reset to zero
-        const directEarningsAfter = await mlm.getDirectEarnings(eligibleUser);
-        const indirectEarningsAfter = await mlm.getIndirectEarnings(eligibleUser);
-        assert.equal(directEarningsAfter.toString(), "0", "Direct earnings should reset");
-        assert.equal(indirectEarningsAfter.toString(), "0", "Indirect earnings should reset");
-    });
-
-    it("should not allow user to withdraw earnings if direct referrals are 10 or less", async () => {
-        const ineligibleUser = user2;
-
-        await mlm.joinProgram("", {from: ineligibleUser});
-
-        // Generate referral code
-        const userCode = await mlm.referralCodes(ineligibleUser);
-
-        // Create exactly 10 direct children (not eligible, as must be >10)
+        // Create exactly 10 direct referrals for u1
         for (let i = 0; i < 10; i++) {
-            const newUser = accounts[6 + i];
-            await usdt.transfer(newUser, JOIN_AMOUNT, {from: admin});
-            await usdt.approve(mlm.address, JOIN_AMOUNT, {from: newUser});
-            await mlm.joinProgram(userCode, {from: newUser});
+            await mlm.joinProgram(codeU1, {from: rest[i]});
         }
 
-        // Attempt to withdraw, should revert
-        await expectRevert(
-            mlm.withdrawEarnings({from: ineligibleUser}),
-            "Need at least 10 direct referrals to withdraw"
+        const count = await mlm.directChildrenCount(u1);
+        assert.equal(count.toString(), "10", "u1 has exactly 10 directs");
+
+        const due =
+            (await mlm.directEarnings(u1)).add(await mlm.indirectEarnings(u1));
+
+        const balBefore = await usdt.balanceOf(u1);
+        await mlm.withdrawEarnings({from: u1});
+        const balAfter = await usdt.balanceOf(u1);
+
+        assert.equal(
+            balAfter.sub(balBefore).toString(),
+            due.toString(),
+            "u1 received total earnings"
+        );
+
+        // earnings reset
+        assert.equal((await mlm.directEarnings(u1)).toString(), "0");
+        assert.equal((await mlm.indirectEarnings(u1)).toString(), "0");
+    });
+
+    it("reverts withdraw if user has < 10 directs", async () => {
+        await mlm.joinProgram("0x000000000000", {from: u2});
+        const codeU2 = await mlm.referralCodes(u2);
+
+        // 9 direct referrals only
+        for (let i = 0; i < 9; i++) {
+            await mlm.joinProgram(codeU2, {from: rest[i]});
+        }
+
+        await expectRevert.unspecified(mlm.withdrawEarnings({from: u2}));
+    });
+
+    // --------------------------------------------------------------------------
+    // Recover tokens: cannot recover main token, can recover other tokens
+    // --------------------------------------------------------------------------
+
+    it("cannot recover main token; can recover a different ERC20", async () => {
+        // Seed the MLM contract with some OTHER token to test recovery
+        const other = await MockUSDT.new({from: admin});
+        const OTHER_SCALE = await scaleOf(other);
+        const deposit = OTHER_SCALE.muln(123);
+
+        await other.transfer(mlm.address, deposit, {from: admin});
+
+        // Recover OTHER token
+        const adminBalBeforeOther = await other.balanceOf(admin);
+        await mlm.recoverERC20(other.address, admin, deposit, {from: admin});
+        const adminBalAfterOther = await other.balanceOf(admin);
+
+        assert.equal(
+            adminBalAfterOther.sub(adminBalBeforeOther).toString(),
+            deposit.toString(),
+            "recovered other token"
+        );
+
+        // Attempt to recover MAIN token should revert
+        await expectRevert.unspecified(
+            mlm.recoverERC20(usdt.address, admin, SCALE, {from: admin})
         );
     });
 
-    it("should allow only admin to deposit USDT and emit event", async () => {
-        const depositAmount = web3.utils.toWei("100", "ether");
+    // --------------------------------------------------------------------------
+    // Referral code properties: uniqueness & alphabet
+    // --------------------------------------------------------------------------
 
-        // Admin deposits USDT
-        const receipt = await mlm.depositUSDT(depositAmount, {from: admin});
+    it("assigns unique 6-char alphanumeric codes; alphabet A-Z and 0-9 only", async () => {
+        await mlm.joinProgram("0x000000000000", {from: u1});
+        await mlm.joinProgram("0x000000000000", {from: u2});
+        await mlm.joinProgram("0x000000000000", {from: u3});
 
-        // Check contract balance
-        const contractBalance = await usdt.balanceOf(mlm.address);
-        assert.equal(contractBalance.toString(), depositAmount, "Contract balance should increase");
+        const s1 = await mlm.referralCodeStringOf(u1);
+        const s2 = await mlm.referralCodeStringOf(u2);
+        const s3 = await mlm.referralCodeStringOf(u3);
 
-        // Check event emission
-        const event = receipt.logs.find(log => log.event === "AdminDeposited");
-        assert.isDefined(event, "AdminDeposited event should be emitted");
-        assert.equal(event.args.admin, admin, "Event admin should match");
-        assert.equal(event.args.amount.toString(), depositAmount, "Event amount should match");
+        // Uniqueness
+        assert.notEqual(s1, s2);
+        assert.notEqual(s1, s3);
+        assert.notEqual(s2, s3);
+
+        // Alphabet constraint
+        const re = /^[A-Z0-9]{6}$/;
+        assert.isTrue(re.test(s1), "s1 alphanumeric 6");
+        assert.isTrue(re.test(s2), "s2 alphanumeric 6");
+        assert.isTrue(re.test(s3), "s3 alphanumeric 6");
     });
 
-    it("should not allow non-admin to deposit USDT", async () => {
-        const depositAmount = web3.utils.toWei("10", "ether");
-        await expectRevert(
-            mlm.depositUSDT(depositAmount, {from: user1}),
-            "Only admin can call this function"
+    // --------------------------------------------------------------------------
+    // Gas / CEI sanity: withdraw zero should revert
+    // --------------------------------------------------------------------------
+
+    it("reverts withdraw when earnings are zero", async () => {
+        await mlm.joinProgram("0x000000000000", {from: u1});
+        const codeU1 = await mlm.referralCodes(u1);
+
+        // Make 10 directs so eligible, but then do a withdraw to zero out…
+        for (let i = 0; i < 10; i++) {
+            await mlm.joinProgram(codeU1, {from: rest[i]});
+        }
+        await mlm.withdrawEarnings({from: u1});
+
+        // Next withdraw with zero balance should revert
+        await expectRevert.unspecified(mlm.withdrawEarnings({from: u1}));
+    });
+
+    // --------------------------------------------------------------------------
+    // Additional edge cases and error handling
+    // --------------------------------------------------------------------------
+
+    it("reverts if user tries to refer themselves", async () => {
+        await mlm.joinProgram("0x000000000000", {from: u1});
+        const codeU1 = await mlm.referralCodes(u1);
+        
+        // u1 tries to join using their own code
+        await expectRevert.unspecified(mlm.joinProgram(codeU1, {from: u1}));
+    });
+
+    it("reverts if user tries to join with invalid referral code", async () => {
+        // Create a fake code that doesn't exist
+        const fakeCode = bytes6FromAscii("FAKE12");
+        
+        await expectRevert.unspecified(mlm.joinProgram(fakeCode, {from: u1}));
+    });
+
+    it("reverts if non-joined user tries to withdraw", async () => {
+        await expectRevert.unspecified(mlm.withdrawEarnings({from: u1}));
+    });
+
+    it("reverts if non-admin tries to withdraw admin funds", async () => {
+        await expectRevert.unspecified(
+            mlm.withdrawAdminFunds(u1, SCALE, {from: u1})
         );
+    });
+
+    it("reverts if non-admin tries to recover ERC20", async () => {
+        const other = await MockUSDT.new({from: admin});
+        await expectRevert.unspecified(
+            mlm.recoverERC20(other.address, u1, SCALE, {from: u1})
+        );
+    });
+
+    // --------------------------------------------------------------------------
+    // Event emission tests
+    // --------------------------------------------------------------------------
+
+    it("emits correct events on user join", async () => {
+        const adminCode = await mlm.referralCodes(admin);
+        
+        const tx = await mlm.joinProgram(adminCode, {from: u1});
+        
+        // Check for UserJoined event
+        const userJoinedEvent = tx.logs.find(log => log.event === 'UserJoined');
+        assert.isTrue(!!userJoinedEvent, "UserJoined event should be emitted");
+        assert.equal(userJoinedEvent.args.user, u1, "UserJoined event should have correct user");
+        assert.equal(userJoinedEvent.args.parent, admin, "UserJoined event should have correct parent");
+        
+        // Check for DirectEarning event
+        const directEarningEvent = tx.logs.find(log => log.event === 'DirectEarning');
+        assert.isTrue(!!directEarningEvent, "DirectEarning event should be emitted");
+        assert.equal(directEarningEvent.args.user, admin, "DirectEarning event should have admin as user");
+        assert.equal(directEarningEvent.args.amount.toString(), DIRECT_REWARD.toString(), "DirectEarning event should have correct amount");
+    });
+
+    it("emits correct events on multi-level join with indirect earnings", async () => {
+        // A joins using admin's code
+        const adminCode = await mlm.referralCodes(admin);
+        await mlm.joinProgram(adminCode, {from: u1});
+        
+        // B joins using A's code (should trigger indirect earnings for admin)
+        const codeA = await mlm.referralCodes(u1);
+        const tx = await mlm.joinProgram(codeA, {from: u2});
+        
+        // Check for UserJoined event
+        const userJoinedEvent = tx.logs.find(log => log.event === 'UserJoined');
+        assert.isTrue(!!userJoinedEvent, "UserJoined event should be emitted");
+        assert.equal(userJoinedEvent.args.user, u2, "UserJoined event should have correct user");
+        assert.equal(userJoinedEvent.args.parent, u1, "UserJoined event should have correct parent");
+        
+        // Check for DirectEarning event (A gets direct reward)
+        const directEarningEvent = tx.logs.find(log => log.event === 'DirectEarning');
+        assert.isTrue(!!directEarningEvent, "DirectEarning event should be emitted");
+        assert.equal(directEarningEvent.args.user, u1, "DirectEarning event should have u1 as user");
+        assert.equal(directEarningEvent.args.amount.toString(), DIRECT_REWARD.toString(), "DirectEarning event should have correct amount");
+        
+        // Check for IndirectEarning event (admin gets indirect reward)
+        const indirectEarningEvent = tx.logs.find(log => log.event === 'IndirectEarning');
+        assert.isTrue(!!indirectEarningEvent, "IndirectEarning event should be emitted");
+        assert.equal(indirectEarningEvent.args.user, admin, "IndirectEarning event should have admin as user");
+        assert.equal(indirectEarningEvent.args.amount.toString(), INDIRECT_TOTAL.toString(), "IndirectEarning event should have correct amount");
+    });
+
+    it("emits correct events on earnings withdrawal", async () => {
+        await mlm.joinProgram("0x000000000000", {from: u1});
+        const codeU1 = await mlm.referralCodes(u1);
+
+        // Create 10 direct referrals for u1
+        for (let i = 0; i < 10; i++) {
+            await mlm.joinProgram(codeU1, {from: rest[i]});
+        }
+
+        const tx = await mlm.withdrawEarnings({from: u1});
+        
+        // Check for EarningsWithdrawn event
+        const earningsWithdrawnEvent = tx.logs.find(log => log.event === 'EarningsWithdrawn');
+        assert.isTrue(!!earningsWithdrawnEvent, "EarningsWithdrawn event should be emitted");
+        assert.equal(earningsWithdrawnEvent.args.user, u1, "EarningsWithdrawn event should have correct user");
+        assert.isTrue(earningsWithdrawnEvent.args.amount.gt(0), "EarningsWithdrawn event should have positive amount");
+    });
+
+    it("emits correct events on admin withdrawal", async () => {
+        const adminCode = await mlm.referralCodes(admin);
+        await mlm.joinProgram(adminCode, {from: u1});
+        
+        const commission = await mlm.adminCommission();
+        const tx = await mlm.withdrawAdminFunds(admin, commission, {from: admin});
+        
+        // Check for AdminWithdrawn event
+        const adminWithdrawnEvent = tx.logs.find(log => log.event === 'AdminWithdrawn');
+        assert.isTrue(!!adminWithdrawnEvent, "AdminWithdrawn event should be emitted");
+        assert.equal(adminWithdrawnEvent.args.to, admin, "AdminWithdrawn event should have correct recipient");
+        assert.equal(adminWithdrawnEvent.args.amount.toString(), commission.toString(), "AdminWithdrawn event should have correct amount");
+    });
+
+    it("emits correct events on ERC20 recovery", async () => {
+        const other = await MockUSDT.new({from: admin});
+        const OTHER_SCALE = await scaleOf(other);
+        const deposit = OTHER_SCALE.muln(123);
+
+        await other.transfer(mlm.address, deposit, {from: admin});
+
+        const tx = await mlm.recoverERC20(other.address, admin, deposit, {from: admin});
+        
+        // Check for ERC20Recovered event
+        const erc20RecoveredEvent = tx.logs.find(log => log.event === 'ERC20Recovered');
+        assert.isTrue(!!erc20RecoveredEvent, "ERC20Recovered event should be emitted");
+        assert.equal(erc20RecoveredEvent.args.erc20, other.address, "ERC20Recovered event should have correct token address");
+        assert.equal(erc20RecoveredEvent.args.to, admin, "ERC20Recovered event should have correct recipient");
+        assert.equal(erc20RecoveredEvent.args.amount.toString(), deposit.toString(), "ERC20Recovered event should have correct amount");
     });
 });

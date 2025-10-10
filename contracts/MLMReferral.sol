@@ -2,162 +2,236 @@
 pragma solidity ^0.8.19;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 
-contract MLMReferral {
-    address public admin;
-    IERC20 public usdt;
+/// @title MLMReferral (production-optimized, 6-char alphanumeric codes)
+contract MLMReferral is ReentrancyGuard {
+    using SafeERC20 for IERC20;
 
-    uint256 public constant JOIN_AMOUNT = 10 * 1e18; // 10 USDT
+    // ─────────── Errors ───────────
+    error OnlyAdmin();
+    error AlreadyJoined();
+    error InvalidReferralCode();
+    error SelfReferral();
+    error ParentNotJoined();
+    error NotJoined();
+    error NeedAtLeast10Directs();
+    error NothingToWithdraw();
+    error AmountExceedsCommission();
+    error RecoverMainTokenForbidden();
 
-    mapping(address => address) public parentOf;               // user => direct parent
-    mapping(address => address[]) public childrenOf;           // user => direct children
-    mapping(address => uint256) public directEarnings;         // user => total direct earnings
-    mapping(address => uint256) public indirectEarnings;       // user => total indirect earnings
-    mapping(address => bool) public hasJoined;                 // user => joined flag
-    mapping(address => string) public referralCodes;           // user => their referral code
-    mapping(string => address) public addressByCode;           // referral code => user
+    // ─────────── Constants / Immutables ───────────
+    uint256 private constant MAX_DEPTH = 10;
 
-    // Events
-    event UserJoined(address indexed user, address indexed parent, string referralCode);
+    address public immutable admin;
+    IERC20 public immutable token;
+    uint8 public immutable tokenDecimals;
+    uint256 public immutable SCALE;
+
+    uint256 public immutable JOIN_AMOUNT;     // 10 * SCALE
+    uint256 public immutable DIRECT_REWARD;   // 2  * SCALE
+    uint256 public immutable INDIRECT_TOTAL;  // 1  * SCALE
+    uint256 public immutable ADMIN_REWARD;    // 7  * SCALE
+
+    // ─────────── Storage ───────────
+    uint256 public adminCommission;
+
+    mapping(address => address) public parentOf;          // user => direct parent
+    mapping(address => address[]) private _childrenOf;    // user => direct children
+    mapping(address => uint256) public directEarnings;
+    mapping(address => uint256) public indirectEarnings;
+    mapping(address => bool)    public hasJoined;
+
+    // Referral codes: fixed 6 ASCII chars (A-Z,0-9) packed in bytes6
+    mapping(address => bytes6)  public referralCodes;     // user => code
+    mapping(bytes6 => address)  public addressByCode;     // code => user
+
+    // ─────────── Events ───────────
+    event UserJoined(address indexed user, address indexed parent, bytes6 referralCode);
     event DirectEarning(address indexed user, uint256 amount);
     event IndirectEarning(address indexed user, uint256 amount);
-    event EarningsWithdrawn(address indexed user);
-    event AdminDeposited(address indexed admin, uint256 amount);
+    event EarningsWithdrawn(address indexed user, uint256 amount);
+    event AdminWithdrawn(address indexed to, uint256 amount);
+    event ERC20Recovered(address indexed erc20, address indexed to, uint256 amount);
 
-    modifier onlyAdmin() {
-        require(msg.sender == admin, "Only admin");
-        _;
-    }
-
-    constructor(address _usdtTokenAddress) {
+    // ─────────── Constructor ───────────
+    constructor(address _token) {
         admin = msg.sender;
-        usdt = IERC20(_usdtTokenAddress);
+        token = IERC20(_token);
 
-        // Mark admin as joined
+        uint8 dec = IERC20Metadata(_token).decimals();
+        tokenDecimals = dec;
+        uint256 scale = 10 ** dec;
+        SCALE = scale;
+
+        JOIN_AMOUNT = 10 * scale;
+        DIRECT_REWARD = 2 * scale;
+        INDIRECT_TOTAL = 1 * scale;
+        ADMIN_REWARD = 7 * scale;
+
         hasJoined[admin] = true;
 
-        // Generate and store referral code for admin
-        string memory code = _generateReferralCode(admin);
+        bytes6 code = _uniqueCodeFor(admin);
         referralCodes[admin] = code;
         addressByCode[code] = admin;
     }
 
-    function joinProgram(string calldata _referralCode) external {
-        require(!hasJoined[msg.sender], "Already joined");
+    // ─────────── Public Views ───────────
+    function getChildren(address user) external view returns (address[] memory) {
+        return _childrenOf[user];
+    }
 
-        address parent;
-        if (bytes(_referralCode).length == 0) {
-            parent = admin;
-        } else {
-            parent = addressByCode[_referralCode];
-            require(parent != address(0), "Invalid referral code");
-        }
+    function directChildrenCount(address user) external view returns (uint256) {
+        return _childrenOf[user].length;
+    }
 
-        require(parent != msg.sender, "Cannot refer yourself");
-        require(hasJoined[parent], "Parent has not joined");
+    /// @notice Human-readable referral code for a user (e.g., "AB12CD")
+    function referralCodeStringOf(address user) external view returns (string memory) {
+        return _toCodeString(referralCodes[user]);
+    }
 
-        require(usdt.transferFrom(msg.sender, address(this), JOIN_AMOUNT), "USDT transfer failed");
+    // ─────────── Core: Join ───────────
+    /// @param refCode 6-char alphanumeric code (bytes6). Pass 0x000000000000 to default to admin.
+    function joinProgram(bytes6 refCode) external nonReentrant {
+        if (hasJoined[msg.sender]) revert AlreadyJoined();
+
+        address parent = refCode == bytes6(0) ? admin : addressByCode[refCode];
+        if (parent == address(0)) revert InvalidReferralCode();
+        if (parent == msg.sender) revert SelfReferral();
+        if (!hasJoined[parent]) revert ParentNotJoined();
+
+        token.safeTransferFrom(msg.sender, address(this), JOIN_AMOUNT);
 
         hasJoined[msg.sender] = true;
         parentOf[msg.sender] = parent;
-        childrenOf[parent].push(msg.sender);
+        _childrenOf[parent].push(msg.sender);
 
-        // Direct earning: 2 USDT to parent
-        uint256 directAmount = 2 * 1e18;
-        directEarnings[parent] += directAmount;
-        emit DirectEarning(parent, directAmount);
+        unchecked {
+            directEarnings[parent] += DIRECT_REWARD;
+        }
+        emit DirectEarning(parent, DIRECT_REWARD);
 
-        // Ancestors for indirect earning (excluding parent)
-        address[100] memory ancestors;
-        uint256 count = 0;
+        // Indirect split among up to 10 ancestors (excluding parent)
         address current = parentOf[parent];
+        address[MAX_DEPTH] memory ancestors;
+        uint256 n;
 
-        while (current != address(0) && count < 100) {
-            ancestors[count] = current;
-            count++;
+        while (current != address(0) && n < MAX_DEPTH) {
+            ancestors[n] = current;
+            unchecked {n++;}
             current = parentOf[current];
         }
 
-        // 1 USDT split among ancestors
-        if (count > 0) {
-            uint256 totalIndirect = 1 * 1e18;
-            uint256 share = totalIndirect / count;
-
-            for (uint256 i = 0; i < count; i++) {
-                indirectEarnings[ancestors[i]] += share;
-                emit IndirectEarning(ancestors[i], share);
+        if (n == 0) {
+            unchecked {adminCommission += INDIRECT_TOTAL;}
+        } else {
+            uint256 share = INDIRECT_TOTAL / n;
+            uint256 remainder = INDIRECT_TOTAL - (share * n);
+            for (uint256 i = 0; i < n;) {
+                unchecked {
+                    indirectEarnings[ancestors[i]] += share;
+                    i++;
+                }
+                emit IndirectEarning(ancestors[i - 1], share);
+            }
+            if (remainder != 0) {
+                unchecked {directEarnings[parent] += remainder;}
+                emit DirectEarning(parent, remainder);
             }
         }
 
-        // Generate and assign referral code
-        string memory code = _generateReferralCode(msg.sender);
+        unchecked {adminCommission += ADMIN_REWARD;}
+
+        // Generate & assign a unique 6-char alphanumeric code
+        bytes6 code = _uniqueCodeFor(msg.sender);
         referralCodes[msg.sender] = code;
         addressByCode[code] = msg.sender;
 
         emit UserJoined(msg.sender, parent, code);
     }
 
-    function withdrawEarnings() external {
-        require(hasJoined[msg.sender], "Not joined");
+    // ─────────── Withdrawals ───────────
+    /// @notice Users can withdraw once they have >= 10 direct referrals.
+    function withdrawEarnings() external nonReentrant {
+        if (!hasJoined[msg.sender]) revert NotJoined();
+        if (_childrenOf[msg.sender].length < 10) revert NeedAtLeast10Directs();
 
-        // Check if direct children count is divisible by 10
-        uint256 directCount = childrenOf[msg.sender].length;
-        require(directCount > 10, "Need at least 10 direct referrals to withdraw");
+        uint256 amount = directEarnings[msg.sender] + indirectEarnings[msg.sender];
+        if (amount == 0) revert NothingToWithdraw();
 
-        uint256 totalEarnings = directEarnings[msg.sender] + indirectEarnings[msg.sender];
-        require(totalEarnings > 0, "No earnings to withdraw");
-
-        // Reset earnings to zero
         directEarnings[msg.sender] = 0;
         indirectEarnings[msg.sender] = 0;
 
-        // Transfer USDT to user
-        require(usdt.transfer(msg.sender, totalEarnings), "USDT transfer failed");
-        emit EarningsWithdrawn(msg.sender);
+        token.safeTransfer(msg.sender, amount);
+        emit EarningsWithdrawn(msg.sender, amount);
     }
 
-    function _generateReferralCode(address user) internal view returns (string memory) {
-        bytes20 addr = bytes20(user);
-        bytes memory alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-        bytes memory code = new bytes(6);
+    /// @notice Admin can withdraw up to accumulated adminCommission.
+    function withdrawAdminFunds(address to, uint256 amount) external nonReentrant {
+        if (msg.sender != admin) revert OnlyAdmin();
+        if (amount > adminCommission) revert AmountExceedsCommission();
 
-        for (uint256 i = 0; i < 6; i++) {
-            code[i] = alphabet[uint8(addr[i]) % alphabet.length];
-        }
+        unchecked {adminCommission -= amount;}
+        token.safeTransfer(to, amount);
+        emit AdminWithdrawn(to, amount);
+    }
 
-        string memory referralCode = string(code);
+    // ─────────── Admin: Recover non-main tokens ───────────
+    function recoverERC20(address erc20, address to, uint256 amount) external nonReentrant {
+        if (msg.sender != admin) revert OnlyAdmin();
+        if (erc20 == address(token)) revert RecoverMainTokenForbidden();
+        IERC20(erc20).safeTransfer(to, amount);
+        emit ERC20Recovered(erc20, to, amount);
+    }
+
+    // ─────────── Internal: 6-char Alphanumeric Code Utils ───────────
+    /// @dev Generates a unique 6-char code using keccak + nonce retry; chars are A–Z then 0–9.
+    function _uniqueCodeFor(address user) internal returns (bytes6) {
         uint256 nonce = 0;
-
-        while (addressByCode[referralCode] != address(0)) {
-            code[5] = alphabet[(uint8(addr[5]) + nonce) % alphabet.length];
-            referralCode = string(code);
-            nonce++;
+        while (true) {
+            bytes6 code = _genCodeTry(user, nonce);
+            // zero is impossible with our alphabet, but keep the guard pattern
+            if (code != bytes6(0) && addressByCode[code] == address(0)) {
+                return code;
+            }
+            unchecked {nonce++;}
         }
-
-        return referralCode;
     }
 
-    // Public view helpers
-    function getDirectEarnings(address user) external view returns (uint256) {
-        return directEarnings[user];
+    function _genCodeTry(address user, uint256 nonce) internal pure returns (bytes6) {
+        bytes32 h = keccak256(abi.encodePacked(user, nonce));
+        uint48 packed; // 6 bytes
+        // derive 6 chars from 6 distinct bytes of the hash
+        for (uint256 i = 0; i < 6;) {
+            uint8 v = uint8(h[i]) % 36; // 0..35
+            bytes1 c = _alpha36(v);     // 'A'-'Z','0'-'9'
+            packed = (packed << 8) | uint48(uint8(c));
+            unchecked {i++;}
+        }
+        return bytes6(packed);
     }
 
-    function getIndirectEarnings(address user) external view returns (uint256) {
-        return indirectEarnings[user];
+    /// @dev Maps 0..35 to ASCII: 0..25 => 'A'..'Z', 26..35 => '0'..'9'
+    function _alpha36(uint8 v) internal pure returns (bytes1) {
+        unchecked {
+            return v < 26 ? bytes1(uint8(65) + v) : bytes1(uint8(48) + (v - 26));
+        }
     }
 
-    function getChildren(address user) external view returns (address[] memory) {
-        return childrenOf[user];
-    }
-
-    // Admin-only withdrawal
-    function withdrawAdminFunds(address to, uint256 amount) external onlyAdmin {
-        require(usdt.transfer(to, amount), "Withdraw failed");
-    }
-
-    // Admin-only deposit function
-    function depositUSDT(uint256 amount) external onlyAdmin {
-        require(usdt.transferFrom(msg.sender, address(this), amount), "USDT transfer failed");
-        emit AdminDeposited(msg.sender, amount);
+    function _toCodeString(bytes6 code) internal pure returns (string memory s) {
+        s = new string(6);
+        assembly {
+            // string data pointer
+            let p := add(s, 32)
+            // write 6 bytes from code into string
+            mstore8(p, byte(0, code))
+            mstore8(add(p, 1), byte(1, code))
+            mstore8(add(p, 2), byte(2, code))
+            mstore8(add(p, 3), byte(3, code))
+            mstore8(add(p, 4), byte(4, code))
+            mstore8(add(p, 5), byte(5, code))
+        }
     }
 }
