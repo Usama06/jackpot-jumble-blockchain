@@ -22,6 +22,19 @@ module.exports = {
             host: "127.0.0.1",     // Localhost (default: none)
             port: 7545,            // Standard Ethereum port (default: none)
             network_id: "5777"       // Any network (default: none)
+        },
+        polygon: {
+            provider: () =>
+                new HDWalletProvider(
+                    process.env.PRIVATE_KEY,
+                    process.env.POLYGON_RPC_URL
+                ),
+            network_id: 137,  // Polygon mainnet network ID
+            confirmations: 2,
+            timeoutBlocks: 200,
+            networkCheckTimeout: 500000,
+            skipDryRun: true,
+            gasPrice: 30_000_000_000,  // 30 Gwei (adjust based on current gas prices)
         }
         //
         // An additional network, but with some advanced options…

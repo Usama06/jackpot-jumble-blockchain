@@ -188,7 +188,7 @@ contract MLMReferral is ReentrancyGuard {
 
     // ─────────── Internal: 6-char Alphanumeric Code Utils ───────────
     /// @dev Generates a unique 6-char code using keccak + nonce retry; chars are A–Z then 0–9.
-    function _uniqueCodeFor(address user) internal returns (bytes6) {
+    function _uniqueCodeFor(address user) internal view returns (bytes6) {
         uint256 nonce = 0;
         while (true) {
             bytes6 code = _genCodeTry(user, nonce);
@@ -198,6 +198,8 @@ contract MLMReferral is ReentrancyGuard {
             }
             unchecked {nonce++;}
         }
+        // This line should never be reached due to the infinite loop, but added for compiler satisfaction
+        return bytes6(0);
     }
 
     function _genCodeTry(address user, uint256 nonce) internal pure returns (bytes6) {
