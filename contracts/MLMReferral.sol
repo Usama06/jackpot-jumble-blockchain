@@ -6,12 +6,13 @@ import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IER
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 
-/// @title MLMReferral (production-optimized, 6-char alphanumeric codes)
+/// @title MLMReferral (production-optimized, 6-char alphanumeric codes with passcode protection)
 contract MLMReferral is ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     // ─────────── Errors ───────────
     error OnlyAdmin();
+    error InvalidPasscode();
     error AlreadyJoined();
     error InvalidReferralCode();
     error SelfReferral();
@@ -35,6 +36,9 @@ contract MLMReferral is ReentrancyGuard {
     uint256 public immutable INDIRECT_TOTAL;  // 1  * SCALE
     uint256 public immutable ADMIN_REWARD;    // 7  * SCALE
 
+    // Passcode hash - stored as keccak256 hash, original is never stored
+    bytes32 private immutable passcodeHash;
+
     // ─────────── Storage ───────────
     uint256 public adminCommission;
 
@@ -56,10 +60,20 @@ contract MLMReferral is ReentrancyGuard {
     event AdminWithdrawn(address indexed to, uint256 amount);
     event ERC20Recovered(address indexed erc20, address indexed to, uint256 amount);
 
+    // ─────────── Modifiers ───────────
+    modifier onlyAdminWithPasscode(string memory passcode) {
+        if (msg.sender != admin) revert OnlyAdmin();
+        if (keccak256(abi.encodePacked(passcode)) != passcodeHash) revert InvalidPasscode();
+        _;
+    }
+
     // ─────────── Constructor ───────────
-    constructor(address _token) {
+    constructor(address _token, string memory _passcode) {
         admin = msg.sender;
         token = IERC20(_token);
+
+        // Hash and store the passcode - original is never stored
+        passcodeHash = keccak256(abi.encodePacked(_passcode));
 
         uint8 dec = IERC20Metadata(_token).decimals();
         tokenDecimals = dec;
@@ -168,9 +182,12 @@ contract MLMReferral is ReentrancyGuard {
         emit EarningsWithdrawn(msg.sender, amount);
     }
 
-    /// @notice Admin can withdraw up to accumulated adminCommission.
-    function withdrawAdminFunds(address to, uint256 amount) external nonReentrant {
-        if (msg.sender != admin) revert OnlyAdmin();
+    /// @notice Admin can withdraw up to accumulated adminCommission (requires passcode).
+    function withdrawAdminFunds(address to, uint256 amount, string memory passcode)
+    external
+    nonReentrant
+    onlyAdminWithPasscode(passcode)
+    {
         if (amount > adminCommission) revert AmountExceedsCommission();
 
         unchecked {adminCommission -= amount;}
@@ -179,8 +196,11 @@ contract MLMReferral is ReentrancyGuard {
     }
 
     // ─────────── Admin: Recover non-main tokens ───────────
-    function recoverERC20(address erc20, address to, uint256 amount) external nonReentrant {
-        if (msg.sender != admin) revert OnlyAdmin();
+    function recoverERC20(address erc20, address to, uint256 amount, string memory passcode)
+    external
+    nonReentrant
+    onlyAdminWithPasscode(passcode)
+    {
         if (erc20 == address(token)) revert RecoverMainTokenForbidden();
         IERC20(erc20).safeTransfer(to, amount);
         emit ERC20Recovered(erc20, to, amount);
