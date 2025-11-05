@@ -13,6 +13,7 @@ contract MLMReferral is ReentrancyGuard {
     // ─────────── Errors ───────────
     error OnlyAdmin();
     error InvalidPasscode();
+    error ZeroAddress();
     error AlreadyJoined();
     error InvalidReferralCode();
     error SelfReferral();
@@ -26,7 +27,6 @@ contract MLMReferral is ReentrancyGuard {
     // ─────────── Constants / Immutables ───────────
     uint256 private constant MAX_DEPTH = 10;
 
-    address public immutable admin;
     IERC20 public immutable token;
     uint8 public immutable tokenDecimals;
     uint256 public immutable SCALE;
@@ -38,6 +38,9 @@ contract MLMReferral is ReentrancyGuard {
 
     // Passcode hash - stored as keccak256 hash, original is never stored
     bytes32 private immutable passcodeHash;
+
+    // ─────────── Mutable Storage ───────────
+    address public admin;
 
     // ─────────── Storage ───────────
     uint256 public adminCommission;
@@ -59,6 +62,7 @@ contract MLMReferral is ReentrancyGuard {
     event EarningsWithdrawn(address indexed user, uint256 amount);
     event AdminWithdrawn(address indexed to, uint256 amount);
     event ERC20Recovered(address indexed erc20, address indexed to, uint256 amount);
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
 
     // ─────────── Modifiers ───────────
     modifier onlyAdminWithPasscode(string memory passcode) {
@@ -204,6 +208,23 @@ contract MLMReferral is ReentrancyGuard {
         if (erc20 == address(token)) revert RecoverMainTokenForbidden();
         IERC20(erc20).safeTransfer(to, amount);
         emit ERC20Recovered(erc20, to, amount);
+    }
+
+    // ─────────── Admin: Transfer Ownership ───────────
+    /// @notice Transfer ownership to a new admin (requires passcode).
+    /// @param newAdmin The address of the new owner
+    /// @param passcode The current passcode for verification
+    function transferOwnership(address newAdmin, string memory passcode)
+    external
+    nonReentrant
+    onlyAdminWithPasscode(passcode)
+    {
+        if (newAdmin == address(0)) revert ZeroAddress();
+
+        address previousAdmin = admin;
+        admin = newAdmin;
+
+        emit OwnershipTransferred(previousAdmin, newAdmin);
     }
 
     // ─────────── Internal: 6-char Alphanumeric Code Utils ───────────
