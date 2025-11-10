@@ -23,6 +23,7 @@ contract MLMReferral is ReentrancyGuard {
     error NothingToWithdraw();
     error AmountExceedsCommission();
     error RecoverMainTokenForbidden();
+    error NewAdminAlreadyJoined();
 
     // ─────────── Constants / Immutables ───────────
     uint256 private constant MAX_DEPTH = 10;
@@ -210,8 +211,8 @@ contract MLMReferral is ReentrancyGuard {
         emit ERC20Recovered(erc20, to, amount);
     }
 
-    // ─────────── Admin: Transfer Ownership ───────────
     /// @notice Transfer ownership to a new admin (requires passcode).
+    /// @dev Transfers the referral code and joined status from previous admin to new admin
     /// @param newAdmin The address of the new owner
     /// @param passcode The current passcode for verification
     function transferOwnership(address newAdmin, string memory passcode)
@@ -220,8 +221,25 @@ contract MLMReferral is ReentrancyGuard {
     onlyAdminWithPasscode(passcode)
     {
         if (newAdmin == address(0)) revert ZeroAddress();
+        if (hasJoined[newAdmin]) revert NewAdminAlreadyJoined();
 
         address previousAdmin = admin;
+
+        // Get the previous admin's referral code
+        bytes6 adminCode = referralCodes[previousAdmin];
+
+        // Transfer referral code to new admin
+        referralCodes[newAdmin] = adminCode;
+        addressByCode[adminCode] = newAdmin;
+
+        // Mark new admin as joined
+        hasJoined[newAdmin] = true;
+
+        // Remove previous admin's referral code and joined status
+        delete referralCodes[previousAdmin];
+        hasJoined[previousAdmin] = false;
+
+        // Update admin address
         admin = newAdmin;
 
         emit OwnershipTransferred(previousAdmin, newAdmin);
